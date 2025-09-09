@@ -11,13 +11,19 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import os
+import threading
+from datetime import datetime
+
+# OASIS imports
+from oasis.functions import deconvolve
+from oasis.oasis_methods import oasisAR1
 
 
 class NeuropilCompensationTool:
     def __init__(self, root):
         self.root = root
         self.root.title("Neuropil Compensation Tool")
-        self.root.geometry("1800x900")
+        self.root.geometry("2200x1000")
         
         # Data storage
         self.F = None
@@ -31,6 +37,20 @@ class NeuropilCompensationTool:
         
         # Row selection parameters
         self.selected_row = tk.IntVar(value=1)  # 1-based indexing for UI
+        
+        # CC-compensation parameters
+        self.cc_compensation_enabled = tk.BooleanVar(value=False)
+        
+        # Deconvolution parameters and results
+        self.sampling_rate = 2.6  # Hz (jRGECO1a)
+        self.jrgeco1a_tau_decay = 1.35  # seconds
+        self.jrgeco1a_g_default = np.exp(-1 / (self.jrgeco1a_tau_decay * self.sampling_rate))
+        
+        # Spike matrices storage
+        self.F_spikes = None
+        self.Fcomp_slider_spikes = None
+        self.Fcomp_cc_spikes = None
+        self.deconvolution_completed = False
         
         self.setup_gui()
         
@@ -78,6 +98,22 @@ class NeuropilCompensationTool:
         self.factor_label = ttk.Label(slider_frame, text="0.000")
         self.factor_label.pack(side=tk.LEFT, padx=(10, 0))
         
+        # Deconvolution button (same height as slider, centered)
+        self.deconvolve_button = ttk.Button(
+            slider_frame, 
+            text="Deconvolve (OASIS)", 
+            command=self.start_deconvolution
+        )
+        self.deconvolve_button.pack(side=tk.LEFT, padx=(50, 10))  # Center with padding
+        
+        # Save button (same height as slider, on the right)
+        self.save_button = ttk.Button(
+            slider_frame, 
+            text="Save Spikes", 
+            command=self.save_spike_matrices
+        )
+        self.save_button.pack(side=tk.LEFT, padx=(10, 0))
+        
         # Row selector frame
         row_frame = ttk.Frame(self.root, padding="10")
         row_frame.pack(fill=tk.X)
@@ -102,6 +138,29 @@ class NeuropilCompensationTool:
         self.down_button = ttk.Button(arrow_frame, text="▼", width=3, command=self.row_down)
         self.down_button.pack()
         
+        # CC-compensation toggle
+        self.cc_toggle = ttk.Checkbutton(
+            row_frame, 
+            text="CC-compensation", 
+            variable=self.cc_compensation_enabled,
+            command=self.on_cc_toggle_change
+        )
+        self.cc_toggle.pack(side=tk.LEFT, padx=(20, 0))
+        
+        # Progress bar for deconvolution (separate frame)
+        self.progress_frame = ttk.Frame(self.root, padding="10")
+        self.progress_frame.pack(fill=tk.X)
+        
+        self.progress_var = tk.StringVar(value="")
+        self.progress_label = ttk.Label(self.progress_frame, textvariable=self.progress_var)
+        self.progress_label.pack()
+        
+        self.progress_bar = ttk.Progressbar(self.progress_frame, mode='determinate')
+        self.progress_bar.pack(fill=tk.X, pady=(5, 0))
+        
+        # Initially hide progress elements
+        self.progress_frame.pack_forget()
+        
     def setup_subplots(self):
         """Create the 3x3 subplot grid."""
         # Create 3x3 grid of subplots
@@ -125,12 +184,17 @@ class NeuropilCompensationTool:
         self.axes[1][1].set_title("Row 2 Time Series")
         self.axes[2][1].set_title("Row 3 Time Series")
         
-        # Set titles for right column placeholder subplots
+        # Set titles for right column (spike matrices)
+        self.axes[0][2].set_title("F Spikes")
+        self.axes[1][2].set_title("Fcomp Spikes (Slider)")
+        self.axes[2][2].set_title("Fcomp Spikes (CC)")
+        
+        # Initially show placeholder text
         for i in range(3):
-            self.axes[i][2].set_title(f"Placeholder ({i+1},{3})")
-            self.axes[i][2].text(0.5, 0.5, "Coming Soon", 
+            self.axes[i][2].text(0.5, 0.5, "Press Deconvolve", 
                                ha='center', va='center', transform=self.axes[i][2].transAxes,
                                fontsize=12, alpha=0.5)
+            self.axes[i][2].axis('off')
         
     def browse_folder(self):
         """Open folder selection dialog and load data."""
@@ -169,8 +233,17 @@ class NeuropilCompensationTool:
             self.F_normalized = self.normalize_matrix(self.F)
             self.Fneu_normalized = self.normalize_matrix(self.Fneu)
             
-            # Reset row selector to valid range
+            # Reset row selector to valid range and CC-compensation state
             self.selected_row.set(1)
+            self.cc_compensation_enabled.set(False)
+            self.on_cc_toggle_change()  # Update UI state
+            
+            # Reset deconvolution results
+            self.F_spikes = None
+            self.Fcomp_slider_spikes = None
+            self.Fcomp_cc_spikes = None
+            self.deconvolution_completed = False
+            self.clear_spike_displays()
             
             # Update displays
             self.update_displays()
@@ -243,6 +316,34 @@ class NeuropilCompensationTool:
         Fcomp = self.F - factor * self.Fneu
         return self.normalize_matrix(Fcomp)
     
+    def calculate_cc_compensation(self):
+        """Calculate compensated matrix using correlation-based compensation for each row."""
+        if self.F is None or self.Fneu is None:
+            return None
+        
+        # Initialize Fcomp with F values
+        Fcomp = self.F.copy()
+        
+        # Calculate row-specific compensation factors based on correlations
+        for row_idx in range(self.F.shape[0]):
+            # Get normalized rows for correlation calculation
+            f_row = self.F_normalized[row_idx, :]
+            fneu_row = self.Fneu_normalized[row_idx, :]
+            
+            # Calculate correlation (compensation factor)
+            correlation = self.calculate_correlation(f_row, fneu_row)
+            
+            # Handle NaN correlations by using 0.0 (no compensation)
+            if np.isnan(correlation):
+                compensation_factor = 0.0
+            else:
+                compensation_factor = correlation  # Use correlation directly (including negative values)
+            
+            # Apply row-specific compensation to raw data
+            Fcomp[row_idx, :] = self.F[row_idx, :] - compensation_factor * self.Fneu[row_idx, :]
+        
+        return self.normalize_matrix(Fcomp)
+    
     def update_displays(self):
         """Update all subplot displays."""
         if self.F is None or self.Fneu is None:
@@ -262,11 +363,17 @@ class NeuropilCompensationTool:
         self.axes[1][0].set_title("Fneu (normalized)")
         self.axes[1][0].axis('on')
         
-        # Display Fcomp (normalized)
-        Fcomp_normalized = self.calculate_compensation(self.compensation_factor.get())
+        # Display Fcomp (normalized) - use appropriate compensation method
+        if self.cc_compensation_enabled.get():
+            Fcomp_normalized = self.calculate_cc_compensation()
+            title = "Fcomp (CC-compensated)"
+        else:
+            Fcomp_normalized = self.calculate_compensation(self.compensation_factor.get())
+            title = "Fcomp (normalized)"
+        
         if Fcomp_normalized is not None:
             self.axes[2][0].imshow(Fcomp_normalized, cmap='viridis', aspect='auto')
-            self.axes[2][0].set_title("Fcomp (normalized)")
+            self.axes[2][0].set_title(title)
             self.axes[2][0].axis('on')
         
         # Update time series plots
@@ -280,8 +387,8 @@ class NeuropilCompensationTool:
         factor = float(value)
         self.factor_label.config(text=f"{factor:.3f}")
         
-        # Update only the Fcomp display
-        if self.F is not None and self.Fneu is not None:
+        # Only update if CC-compensation is disabled
+        if not self.cc_compensation_enabled.get() and self.F is not None and self.Fneu is not None:
             self.axes[2][0].clear()
             Fcomp_normalized = self.calculate_compensation(factor)
             if Fcomp_normalized is not None:
@@ -289,12 +396,50 @@ class NeuropilCompensationTool:
                 self.axes[2][0].set_title("Fcomp (normalized)")
                 self.axes[2][0].axis('on')
             
-            # Update time series plots
-            self.update_timeseries_plots()
+            # Update only Fcomp traces in time series plots (correlation doesn't change)
+            self.update_fcomp_traces_only()
             
+            self.canvas.draw()
+    
+    def on_cc_toggle_change(self):
+        """Handle CC-compensation toggle changes."""
+        cc_enabled = self.cc_compensation_enabled.get()
+        
+        # Enable/disable main slider based on CC-compensation state
+        if cc_enabled:
+            self.slider.config(state='disabled')
+            self.factor_label.config(foreground='gray')
+        else:
+            self.slider.config(state='normal')
+            self.factor_label.config(foreground='black')
+        
+        # Update all displays with new compensation method
+        if self.F is not None and self.Fneu is not None:
+            self.update_displays()
+            self.update_timeseries_plots()
             self.canvas.draw()
 
 
+    def calculate_correlation(self, f_row, fneu_row):
+        """Calculate Pearson correlation between F and Fneu rows, handling NaN values."""
+        # Create masks for valid (non-NaN) values
+        valid_mask = ~(np.isnan(f_row) | np.isnan(fneu_row))
+        
+        # Check if we have enough valid data points
+        if np.sum(valid_mask) < 2:
+            return np.nan
+        
+        # Extract valid values
+        f_valid = f_row[valid_mask]
+        fneu_valid = fneu_row[valid_mask]
+        
+        # Calculate Pearson correlation
+        if len(f_valid) < 2 or np.std(f_valid) == 0 or np.std(fneu_valid) == 0:
+            return np.nan
+        
+        correlation_matrix = np.corrcoef(f_valid, fneu_valid)
+        return correlation_matrix[0, 1]
+    
     def update_timeseries_plots(self):
         """Update the middle column time series plots."""
         if self.F is None or self.Fneu is None:
@@ -307,10 +452,13 @@ class NeuropilCompensationTool:
         if start_row + 2 >= max_row:
             return
         
-        # Calculate Fcomp for current compensation factor
-        factor = self.compensation_factor.get()
-        Fcomp = self.F - factor * self.Fneu
-        Fcomp_normalized = self.normalize_matrix(Fcomp)
+        # Calculate Fcomp using appropriate compensation method
+        if self.cc_compensation_enabled.get():
+            Fcomp_normalized = self.calculate_cc_compensation()
+        else:
+            factor = self.compensation_factor.get()
+            Fcomp = self.F - factor * self.Fneu
+            Fcomp_normalized = self.normalize_matrix(Fcomp)
         
         # Update each of the three middle subplots
         for i in range(3):
@@ -323,6 +471,9 @@ class NeuropilCompensationTool:
             fneu_row = self.Fneu_normalized[current_row, :]
             fcomp_row = Fcomp_normalized[current_row, :]
             
+            # Calculate correlation between F and Fneu (independent of compensation)
+            correlation = self.calculate_correlation(f_row, fneu_row)
+            
             # Create time axis
             time_points = np.arange(len(f_row))
             
@@ -331,9 +482,12 @@ class NeuropilCompensationTool:
             ax.plot(time_points, fneu_row, 'r-', label='Fneu', linewidth=1.5)
             ax.plot(time_points, fcomp_row, 'k-', label='Fcomp', linewidth=1.5)
             
-            # Configure plot
+            # Configure plot with correlation in title
             ax.set_ylim(0, 1)
-            ax.set_title(f"Row {current_row + 1} Time Series")
+            if np.isnan(correlation):
+                ax.set_title(f"Row {current_row + 1} Time Series (corr=NaN)")
+            else:
+                ax.set_title(f"Row {current_row + 1} Time Series (corr={correlation:.2f})")
             ax.grid(True, alpha=0.3)
             ax.legend(loc='upper right', fontsize=8)
             
@@ -396,6 +550,421 @@ class NeuropilCompensationTool:
             self.selected_row.set(current - 1)
             self.update_timeseries_plots()
             self.canvas.draw()
+
+
+    def update_fcomp_traces_only(self):
+        """Update only the Fcomp traces in time series plots when slider moves."""
+        if self.F is None or self.Fneu is None:
+            return
+        
+        start_row = self.selected_row.get() - 1  # Convert to 0-based indexing
+        max_row = self.F.shape[0]
+        
+        # Ensure we don't go out of bounds
+        if start_row + 2 >= max_row:
+            return
+        
+        # Calculate Fcomp using appropriate compensation method
+        if self.cc_compensation_enabled.get():
+            Fcomp_normalized = self.calculate_cc_compensation()
+        else:
+            factor = self.compensation_factor.get()
+            Fcomp = self.F - factor * self.Fneu
+            Fcomp_normalized = self.normalize_matrix(Fcomp)
+        
+        # Update only the Fcomp traces in each subplot
+        for i in range(3):
+            current_row = start_row + i
+            ax = self.axes[i][1]
+            
+            # Get the Fcomp row
+            fcomp_row = Fcomp_normalized[current_row, :]
+            
+            # Remove only the Fcomp line (black line, should be the last one added)
+            lines = ax.get_lines()
+            if len(lines) >= 3:  # Should have F, Fneu, and Fcomp lines
+                lines[-1].remove()  # Remove the last line (Fcomp)
+            
+            # Create time axis and plot new Fcomp trace
+            time_points = np.arange(len(fcomp_row))
+            ax.plot(time_points, fcomp_row, 'k-', label='Fcomp', linewidth=1.5)
+            
+            # Update legend
+            ax.legend(loc='upper right', fontsize=8)
+
+
+    def preprocess_data_for_deconv(self, data):
+        """Preprocess data by removing artifact columns for deconvolution (mirrors batch script)."""
+        n_traces, n_timepoints = data.shape
+        
+        # Handle different matrix sizes
+        if n_timepoints == 1520:
+            # Remove columns 725-732 (0-based: 724-731) 
+            clean_data = np.concatenate([data[:, :724], data[:, 732:]], axis=1)
+            artifact_info = {'start': 724, 'end': 731, 'original_cols': n_timepoints}
+        elif n_timepoints == 2890:
+            # Remove columns 1379-1387 (0-based: 1378-1386)
+            clean_data = np.concatenate([data[:, :1378], data[:, 1387:]], axis=1)
+            artifact_info = {'start': 1378, 'end': 1386, 'original_cols': n_timepoints}
+        else:
+            # No artifact removal for other sizes - just return original data
+            clean_data = data.copy()
+            artifact_info = {'start': None, 'end': None, 'original_cols': n_timepoints}
+        
+        return clean_data, artifact_info
+    
+    def postprocess_results_for_deconv(self, deconv_result, spike_result, artifact_info):
+        """Insert NaN columns back into results at artifact positions (mirrors batch script)."""
+        if artifact_info['start'] is None:
+            # No artifacts to reinsert
+            return deconv_result, spike_result
+        
+        n_traces = deconv_result.shape[0]
+        original_cols = artifact_info['original_cols']
+        artifact_start = artifact_info['start']
+        artifact_end = artifact_info['end']
+        artifact_width = artifact_end - artifact_start + 1
+        
+        # Create output arrays with NaNs at artifact positions
+        deconv_with_nans = np.full((n_traces, original_cols), np.nan, dtype=np.float64)
+        spike_with_nans = np.full((n_traces, original_cols), np.nan, dtype=np.float64)
+        
+        # Fill in the deconvolved data
+        deconv_with_nans[:, :artifact_start] = deconv_result[:, :artifact_start]  # Before artifact
+        deconv_with_nans[:, artifact_end+1:] = deconv_result[:, artifact_start:]  # After artifact
+        
+        # Fill in the spike data  
+        spike_with_nans[:, :artifact_start] = spike_result[:, :artifact_start]   # Before artifact
+        spike_with_nans[:, artifact_end+1:] = spike_result[:, artifact_start:]   # After artifact
+        
+        # Columns at artifact positions remain as NaN
+        
+        return deconv_with_nans, spike_with_nans
+    
+    def calculate_jrgeco1a_params(self):
+        """Calculate jRGECO1a-specific parameters for OASIS deconvolution."""
+        return {
+            'g': self.jrgeco1a_g_default,
+            'baseline': None,  # Let OASIS estimate
+            'noise': None,     # Let OASIS estimate
+            'penalty': 0,      # L0 penalty for sparse results
+            'optimize_g': False  # Use fixed g parameter
+        }
+    
+    def process_single_trace_oasis(self, trace, params):
+        """Process a single calcium trace with OASIS deconvolution."""
+        try:
+            # Use jRGECO1a defaults
+            c, s, b, g, lam = deconvolve(
+                trace, 
+                g=(params['g'],),
+                penalty=params['penalty'],
+                optimize_g=params['optimize_g']
+            )
+            
+            return {
+                'success': True,
+                'denoised': c,
+                'spikes': s,
+                'baseline': b,
+                'g_param': g,
+                'lambda': lam,
+                'error': None
+            }
+            
+        except Exception as e:
+            # Return NaN arrays for failed processing
+            return {
+                'success': False,
+                'denoised': np.full_like(trace, np.nan),
+                'spikes': np.full_like(trace, np.nan),
+                'baseline': np.nan,
+                'g_param': np.nan,
+                'lambda': np.nan,
+                'error': str(e)
+            }
+    
+    def deconvolve_matrix(self, matrix, matrix_name):
+        """Deconvolve an entire matrix and return spike matrix (mirrors batch script approach)."""
+        if matrix is None:
+            return None
+        
+        n_traces, n_timepoints = matrix.shape
+        params = self.calculate_jrgeco1a_params()
+        failed_traces = []
+        
+        # Preprocess: Remove artifact columns for deconvolution
+        self.progress_var.set(f"Preprocessing {matrix_name} (removing artifact columns)...")
+        self.root.update()
+        clean_matrix, artifact_info = self.preprocess_data_for_deconv(matrix)
+        clean_traces, clean_timepoints = clean_matrix.shape
+        
+        # Prepare output arrays for clean data
+        denoised_traces_clean = np.zeros_like(clean_matrix, dtype=np.float64)
+        spike_traces_clean = np.zeros_like(clean_matrix, dtype=np.float64)
+        
+        # Process each clean trace
+        for trace_idx in range(n_traces):
+            # Update progress
+            progress = int((trace_idx / n_traces) * 100)
+            self.progress_var.set(f"Processing {matrix_name}: {trace_idx+1}/{n_traces} traces")
+            self.progress_bar['value'] = progress
+            self.root.update()
+            
+            clean_trace = clean_matrix[trace_idx, :].astype(np.float64)
+            
+            # Skip traces that are all NaN (shouldn't happen after preprocessing, but safety check)
+            if np.all(np.isnan(clean_trace)):
+                denoised_traces_clean[trace_idx, :] = np.nan
+                spike_traces_clean[trace_idx, :] = np.nan
+                failed_traces.append(trace_idx + 1)  # 1-based indexing for user
+                continue
+            
+            # Process the clean trace
+            result = self.process_single_trace_oasis(clean_trace, params)
+            
+            if result['success']:
+                denoised_traces_clean[trace_idx, :] = result['denoised']
+                spike_traces_clean[trace_idx, :] = result['spikes']
+            else:
+                denoised_traces_clean[trace_idx, :] = np.nan
+                spike_traces_clean[trace_idx, :] = np.nan
+                failed_traces.append(trace_idx + 1)  # 1-based indexing for user
+        
+        # Postprocess: Reinsert NaN columns at artifact positions
+        self.progress_var.set(f"Postprocessing {matrix_name} (reinserting artifact columns)...")
+        self.root.update()
+        denoised_final, spike_final = self.postprocess_results_for_deconv(
+            denoised_traces_clean, spike_traces_clean, artifact_info
+        )
+        
+        return spike_final, failed_traces
+    
+    def start_deconvolution(self):
+        """Start deconvolution process in background thread."""
+        if self.F is None or self.Fneu is None:
+            messagebox.showwarning("Warning", "Please load data first!")
+            return
+        
+        # Disable button during processing
+        self.deconvolve_button.config(state='disabled')
+        
+        # Show progress elements
+        self.progress_frame.pack(fill=tk.X, pady=(10, 0))
+        self.progress_var.set("Starting deconvolution...")
+        self.progress_bar['value'] = 0
+        
+        # Start processing in background thread
+        processing_thread = threading.Thread(target=self._deconvolution_worker)
+        processing_thread.daemon = True
+        processing_thread.start()
+    
+    def _deconvolution_worker(self):
+        """Background worker for deconvolution processing."""
+        try:
+            all_failed_traces = []
+            
+            # 1. Deconvolve F matrix
+            self.progress_var.set("Deconvolving F matrix...")
+            self.root.update()
+            F_spikes, F_failed = self.deconvolve_matrix(self.F, "F")
+            self.F_spikes = F_spikes
+            all_failed_traces.extend([(trace, "F") for trace in F_failed])
+            
+            # 2. Deconvolve Fcomp (slider compensation)
+            self.progress_var.set("Calculating Fcomp (slider)...")
+            self.root.update()
+            factor = self.compensation_factor.get()
+            Fcomp_slider = self.F - factor * self.Fneu
+            Fcomp_slider_spikes, Fcomp_slider_failed = self.deconvolve_matrix(Fcomp_slider, "Fcomp (slider)")
+            self.Fcomp_slider_spikes = Fcomp_slider_spikes
+            all_failed_traces.extend([(trace, "Fcomp_slider") for trace in Fcomp_slider_failed])
+            
+            # 3. Deconvolve Fcomp (CC compensation)
+            self.progress_var.set("Calculating Fcomp (CC)...")
+            self.root.update()
+            Fcomp_cc = self.calculate_cc_compensation_raw()  # Get raw CC-compensated matrix
+            Fcomp_cc_spikes, Fcomp_cc_failed = self.deconvolve_matrix(Fcomp_cc, "Fcomp (CC)")
+            self.Fcomp_cc_spikes = Fcomp_cc_spikes
+            all_failed_traces.extend([(trace, "Fcomp_CC") for trace in Fcomp_cc_failed])
+            
+            # Update displays
+            self.progress_var.set("Updating displays...")
+            self.root.update()
+            self.update_spike_displays()
+            
+            # Mark completion
+            self.deconvolution_completed = True
+            
+            # Show completion message
+            total_traces = self.F.shape[0]
+            total_failed = len(all_failed_traces)
+            success_rate = ((total_traces * 3 - total_failed) / (total_traces * 3)) * 100
+            
+            completion_msg = f"Deconvolution completed!\\nSuccess rate: {success_rate:.1f}%"
+            if total_failed > 0:
+                completion_msg += f"\\n{total_failed} traces failed (shown as white)"
+            
+            self.progress_var.set("Deconvolution completed!")
+            messagebox.showinfo("Deconvolution Complete", completion_msg)
+            
+            # Show failed traces log if any
+            if all_failed_traces:
+                self.show_failed_traces_log(all_failed_traces)
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Deconvolution failed: {str(e)}")
+            
+        finally:
+            # Re-enable button and hide progress
+            self.deconvolve_button.config(state='normal')
+            self.progress_frame.pack_forget()
+    
+    def calculate_cc_compensation_raw(self):
+        """Calculate raw CC-compensated matrix (not normalized)."""
+        if self.F is None or self.Fneu is None:
+            return None
+        
+        # Initialize Fcomp with F values
+        Fcomp = self.F.copy()
+        
+        # Calculate row-specific compensation factors based on correlations
+        for row_idx in range(self.F.shape[0]):
+            # Get normalized rows for correlation calculation
+            f_row = self.F_normalized[row_idx, :]
+            fneu_row = self.Fneu_normalized[row_idx, :]
+            
+            # Calculate correlation (compensation factor)
+            correlation = self.calculate_correlation(f_row, fneu_row)
+            
+            # Handle NaN correlations by using 0.0 (no compensation)
+            if np.isnan(correlation):
+                compensation_factor = 0.0
+            else:
+                compensation_factor = correlation
+            
+            # Apply row-specific compensation to raw data
+            Fcomp[row_idx, :] = self.F[row_idx, :] - compensation_factor * self.Fneu[row_idx, :]
+        
+        return Fcomp
+    
+    def update_spike_displays(self):
+        """Update the right column spike matrix displays."""
+        spike_matrices = [
+            (self.F_spikes, "F Spikes"),
+            (self.Fcomp_slider_spikes, "Fcomp Spikes (Slider)"),
+            (self.Fcomp_cc_spikes, "Fcomp Spikes (CC)")
+        ]
+        
+        for i, (spike_matrix, title) in enumerate(spike_matrices):
+            ax = self.axes[i][2]
+            ax.clear()
+            
+            if spike_matrix is not None:
+                # Display spike matrix in grayscale (1=black, 0=white)
+                ax.imshow(spike_matrix, cmap='gray_r', aspect='auto', vmin=0, vmax=1)
+                ax.set_title(title)
+                ax.axis('on')
+            else:
+                ax.set_title(title)
+                ax.text(0.5, 0.5, "Press Deconvolve", 
+                       ha='center', va='center', transform=ax.transAxes,
+                       fontsize=12, alpha=0.5)
+                ax.axis('off')
+        
+        self.canvas.draw()
+    
+    def clear_spike_displays(self):
+        """Clear the spike matrix displays."""
+        for i in range(3):
+            ax = self.axes[i][2]
+            ax.clear()
+            ax.text(0.5, 0.5, "Press Deconvolve", 
+                   ha='center', va='center', transform=ax.transAxes,
+                   fontsize=12, alpha=0.5)
+            ax.axis('off')
+        self.canvas.draw()
+    
+    def show_failed_traces_log(self, failed_traces):
+        """Show a log of failed traces in a popup window."""
+        log_window = tk.Toplevel(self.root)
+        log_window.title("Deconvolution Failed Traces")
+        log_window.geometry("400x300")
+        
+        # Create scrollable text widget
+        frame = ttk.Frame(log_window)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        text_widget = tk.Text(frame, wrap=tk.WORD)
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        # Group failed traces by matrix type
+        f_failed = [trace for trace, matrix in failed_traces if matrix == "F"]
+        slider_failed = [trace for trace, matrix in failed_traces if matrix == "Fcomp_slider"]
+        cc_failed = [trace for trace, matrix in failed_traces if matrix == "Fcomp_CC"]
+        
+        log_content = f"Deconvolution Failed Traces Log\\n"
+        log_content += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n"
+        log_content += "=" * 40 + "\\n\\n"
+        
+        if f_failed:
+            log_content += f"F matrix failed traces ({len(f_failed)}): {', '.join(map(str, f_failed))}\\n\\n"
+        
+        if slider_failed:
+            log_content += f"Fcomp (slider) failed traces ({len(slider_failed)}): {', '.join(map(str, slider_failed))}\\n\\n"
+        
+        if cc_failed:
+            log_content += f"Fcomp (CC) failed traces ({len(cc_failed)}): {', '.join(map(str, cc_failed))}\\n\\n"
+        
+        log_content += "These traces are displayed as white (NaN) in the spike matrices."
+        
+        text_widget.insert(tk.END, log_content)
+        text_widget.config(state=tk.DISABLED)
+        
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Add close button
+        ttk.Button(log_window, text="Close", command=log_window.destroy).pack(pady=10)
+    
+    def save_spike_matrices(self):
+        """Save the three deconvolved spike matrices to the original data folder."""
+        # Check if deconvolution has been completed
+        if not self.deconvolution_completed or self.current_folder is None:
+            messagebox.showwarning("Warning", "Please complete deconvolution first!")
+            return
+        
+        # Check if all spike matrices are available
+        if self.F_spikes is None or self.Fcomp_slider_spikes is None or self.Fcomp_cc_spikes is None:
+            messagebox.showwarning("Warning", "Spike matrices are not available. Please run deconvolution first!")
+            return
+        
+        try:
+            # Get the slider value used for compensation
+            slider_value = self.compensation_factor.get()
+            
+            # Define filenames
+            f_filename = os.path.join(self.current_folder, "F_deconv.npy")
+            fcomp_slider_filename = os.path.join(self.current_folder, f"Fcomp_{slider_value:.3f}.npy")
+            fcomp_cc_filename = os.path.join(self.current_folder, "Fcomp_CC.npy")
+            
+            # Save the matrices
+            np.save(f_filename, self.F_spikes)
+            np.save(fcomp_slider_filename, self.Fcomp_slider_spikes)
+            np.save(fcomp_cc_filename, self.Fcomp_cc_spikes)
+            
+            # Show success message with file locations
+            success_msg = f"Successfully saved spike matrices:\\n\\n"
+            success_msg += f"• F_deconv.npy\\n"
+            success_msg += f"• Fcomp_{slider_value:.3f}.npy\\n"
+            success_msg += f"• Fcomp_CC.npy\\n\\n"
+            success_msg += f"Location: {self.current_folder}"
+            
+            messagebox.showinfo("Save Complete", success_msg)
+            
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save spike matrices:\\n{str(e)}")
 
 
 def main():
