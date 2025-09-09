@@ -1,4 +1,4 @@
-numpy
-scipy
-matplotlib
-Cython
+numpy<2
+scipy>=1.16.0
+matplotlib>=3.10.0
+Cython>=3.1.0

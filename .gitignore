@@ -14,5 +14,6 @@ build/
 # Editors
 .idea/
 
-# Environment
+# Virtual environments
+venv/
 .venv/

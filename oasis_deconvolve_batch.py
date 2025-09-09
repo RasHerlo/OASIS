@@ -28,7 +28,7 @@ class OASISBatchProcessor:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("OASIS Batch Deconvolution - jRGECO1a")
-        self.root.geometry("600x400")
+        self.root.geometry("600x500")
         
         # jRGECO1a parameters for 2.6Hz sampling
         self.sampling_rate = 2.6  # Hz
