@@ -17,7 +17,7 @@ class NeuropilCompensationTool:
     def __init__(self, root):
         self.root = root
         self.root.title("Neuropil Compensation Tool")
-        self.root.geometry("1200x900")
+        self.root.geometry("1800x900")
         
         # Data storage
         self.F = None
@@ -162,6 +162,9 @@ class NeuropilCompensationTool:
             if self.F.shape != self.Fneu.shape:
                 raise ValueError(f"Matrix dimensions don't match: F {self.F.shape} vs Fneu {self.Fneu.shape}")
             
+            # Remove artifacts before normalization
+            self.remove_artifacts()
+            
             # Cache normalized matrices
             self.F_normalized = self.normalize_matrix(self.F)
             self.Fneu_normalized = self.normalize_matrix(self.Fneu)
@@ -183,20 +186,51 @@ class NeuropilCompensationTool:
             self.F_normalized = None
             self.Fneu_normalized = None
     
+    def remove_artifacts(self):
+        """Remove artifacts by replacing specific columns with NaN values."""
+        if self.F is None or self.Fneu is None:
+            return
+        
+        n_cols = self.F.shape[1]
+        
+        # Define artifact column ranges based on matrix width
+        if n_cols == 1520:
+            # Replace columns 725-732 (0-based: 724-731)
+            artifact_start, artifact_end = 724, 731
+        elif n_cols == 2890:
+            # Replace columns 1379-1387 (0-based: 1378-1386)
+            artifact_start, artifact_end = 1378, 1386
+        else:
+            # No artifact removal for other sizes
+            return
+        
+        # Replace artifact columns with NaN
+        self.F[:, artifact_start:artifact_end+1] = np.nan
+        self.Fneu[:, artifact_start:artifact_end+1] = np.nan
+        
+        print(f"Removed artifacts: columns {artifact_start+1}-{artifact_end+1} (1-based) set to NaN")
+    
     def normalize_matrix(self, matrix):
-        """Normalize each row of the matrix to [0, 1] range."""
+        """Normalize each row of the matrix to [0, 1] range, handling NaN values."""
         normalized = np.zeros_like(matrix, dtype=np.float64)
         
         for i in range(matrix.shape[0]):
             row = matrix[i, :].astype(np.float64)
-            row_min = np.min(row)
-            row_max = np.max(row)
             
-            # Handle case where max == min (constant row)
-            if row_max == row_min:
-                normalized[i, :] = 0.0
+            # Use nanmin and nanmax to ignore NaN values
+            row_min = np.nanmin(row)
+            row_max = np.nanmax(row)
+            
+            # Handle case where all values are NaN
+            if np.isnan(row_min) or np.isnan(row_max):
+                normalized[i, :] = np.nan
+            # Handle case where max == min (constant row, ignoring NaNs)
+            elif row_max == row_min:
+                normalized[i, :] = np.where(np.isnan(row), np.nan, 0.0)
             else:
                 normalized[i, :] = (row - row_min) / (row_max - row_min)
+                # Preserve NaN values in the normalized result
+                normalized[i, :] = np.where(np.isnan(row), np.nan, normalized[i, :])
         
         return normalized
     
@@ -205,6 +239,7 @@ class NeuropilCompensationTool:
         if self.F is None or self.Fneu is None:
             return None
         
+        # Calculate compensation on raw matrices (NaN values will propagate correctly)
         Fcomp = self.F - factor * self.Fneu
         return self.normalize_matrix(Fcomp)
     
