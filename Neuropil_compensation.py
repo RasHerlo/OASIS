@@ -29,6 +29,9 @@ class NeuropilCompensationTool:
         # Compensation parameters
         self.compensation_factor = tk.DoubleVar(value=0.0)
         
+        # Row selection parameters
+        self.selected_row = tk.IntVar(value=1)  # 1-based indexing for UI
+        
         self.setup_gui()
         
     def setup_gui(self):
@@ -75,6 +78,30 @@ class NeuropilCompensationTool:
         self.factor_label = ttk.Label(slider_frame, text="0.000")
         self.factor_label.pack(side=tk.LEFT, padx=(10, 0))
         
+        # Row selector frame
+        row_frame = ttk.Frame(self.root, padding="10")
+        row_frame.pack(fill=tk.X)
+        
+        ttk.Label(row_frame, text="Row Selection:").pack(side=tk.LEFT)
+        
+        # Row selector with up/down arrows
+        row_control_frame = ttk.Frame(row_frame)
+        row_control_frame.pack(side=tk.LEFT, padx=(10, 0))
+        
+        self.row_entry = ttk.Entry(row_control_frame, textvariable=self.selected_row, width=8)
+        self.row_entry.pack(side=tk.LEFT)
+        self.row_entry.bind('<Return>', self.on_row_entry_change)
+        self.row_entry.bind('<FocusOut>', self.on_row_entry_change)
+        
+        arrow_frame = ttk.Frame(row_control_frame)
+        arrow_frame.pack(side=tk.LEFT, padx=(2, 0))
+        
+        self.up_button = ttk.Button(arrow_frame, text="▲", width=3, command=self.row_up)
+        self.up_button.pack()
+        
+        self.down_button = ttk.Button(arrow_frame, text="▼", width=3, command=self.row_down)
+        self.down_button.pack()
+        
     def setup_subplots(self):
         """Create the 3x3 subplot grid."""
         # Create 3x3 grid of subplots
@@ -93,13 +120,17 @@ class NeuropilCompensationTool:
         self.axes[1][0].set_title("Fneu (normalized)")
         self.axes[2][0].set_title("Fcomp (normalized)")
         
-        # Set titles for placeholder subplots
+        # Set titles for middle column (time series plots)
+        self.axes[0][1].set_title("Row 1 Time Series")
+        self.axes[1][1].set_title("Row 2 Time Series")
+        self.axes[2][1].set_title("Row 3 Time Series")
+        
+        # Set titles for right column placeholder subplots
         for i in range(3):
-            for j in range(1, 3):
-                self.axes[i][j].set_title(f"Placeholder ({i+1},{j+1})")
-                self.axes[i][j].text(0.5, 0.5, "Coming Soon", 
-                                   ha='center', va='center', transform=self.axes[i][j].transAxes,
-                                   fontsize=12, alpha=0.5)
+            self.axes[i][2].set_title(f"Placeholder ({i+1},{3})")
+            self.axes[i][2].text(0.5, 0.5, "Coming Soon", 
+                               ha='center', va='center', transform=self.axes[i][2].transAxes,
+                               fontsize=12, alpha=0.5)
         
     def browse_folder(self):
         """Open folder selection dialog and load data."""
@@ -135,8 +166,12 @@ class NeuropilCompensationTool:
             self.F_normalized = self.normalize_matrix(self.F)
             self.Fneu_normalized = self.normalize_matrix(self.Fneu)
             
+            # Reset row selector to valid range
+            self.selected_row.set(1)
+            
             # Update displays
             self.update_displays()
+            self.update_timeseries_plots()
             
             # Show success message
             messagebox.showinfo("Success", f"Successfully loaded matrices of shape {self.F.shape}")
@@ -199,6 +234,9 @@ class NeuropilCompensationTool:
             self.axes[2][0].set_title("Fcomp (normalized)")
             self.axes[2][0].axis('on')
         
+        # Update time series plots
+        self.update_timeseries_plots()
+        
         # Refresh canvas
         self.canvas.draw()
     
@@ -216,6 +254,112 @@ class NeuropilCompensationTool:
                 self.axes[2][0].set_title("Fcomp (normalized)")
                 self.axes[2][0].axis('on')
             
+            # Update time series plots
+            self.update_timeseries_plots()
+            
+            self.canvas.draw()
+
+
+    def update_timeseries_plots(self):
+        """Update the middle column time series plots."""
+        if self.F is None or self.Fneu is None:
+            return
+        
+        start_row = self.selected_row.get() - 1  # Convert to 0-based indexing
+        max_row = self.F.shape[0]
+        
+        # Ensure we don't go out of bounds
+        if start_row + 2 >= max_row:
+            return
+        
+        # Calculate Fcomp for current compensation factor
+        factor = self.compensation_factor.get()
+        Fcomp = self.F - factor * self.Fneu
+        Fcomp_normalized = self.normalize_matrix(Fcomp)
+        
+        # Update each of the three middle subplots
+        for i in range(3):
+            current_row = start_row + i
+            ax = self.axes[i][1]
+            ax.clear()
+            
+            # Get normalized rows
+            f_row = self.F_normalized[current_row, :]
+            fneu_row = self.Fneu_normalized[current_row, :]
+            fcomp_row = Fcomp_normalized[current_row, :]
+            
+            # Create time axis
+            time_points = np.arange(len(f_row))
+            
+            # Plot the three traces
+            ax.plot(time_points, f_row, 'g-', label='F', linewidth=1.5)
+            ax.plot(time_points, fneu_row, 'r-', label='Fneu', linewidth=1.5)
+            ax.plot(time_points, fcomp_row, 'k-', label='Fcomp', linewidth=1.5)
+            
+            # Configure plot
+            ax.set_ylim(0, 1)
+            ax.set_title(f"Row {current_row + 1} Time Series")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper right', fontsize=8)
+            
+            # Only show x-label on bottom subplot
+            if i == 2:
+                ax.set_xlabel('Time Points')
+            
+            ax.set_ylabel('Normalized Signal')
+    
+    def validate_row_selection(self):
+        """Validate and constrain row selection within valid bounds."""
+        if self.F is None:
+            return False
+        
+        current_row = self.selected_row.get()
+        max_allowed = self.F.shape[0] - 2  # Ensure we can show 3 consecutive rows
+        
+        if current_row < 1:
+            self.selected_row.set(1)
+            return True
+        elif current_row > max_allowed:
+            self.selected_row.set(max_allowed)
+            return True
+        
+        return False
+    
+    def on_row_entry_change(self, event=None):
+        """Handle changes to the row entry field."""
+        try:
+            # Validate and update if needed
+            if self.validate_row_selection():
+                pass  # Value was corrected
+            
+            # Update plots
+            self.update_timeseries_plots()
+            self.canvas.draw()
+            
+        except tk.TclError:
+            # Handle invalid input by resetting to 1
+            self.selected_row.set(1)
+    
+    def row_up(self):
+        """Increment row selection."""
+        if self.F is None:
+            return
+        
+        current = self.selected_row.get()
+        max_allowed = self.F.shape[0] - 2
+        
+        if current < max_allowed:
+            self.selected_row.set(current + 1)
+            self.update_timeseries_plots()
+            self.canvas.draw()
+    
+    def row_down(self):
+        """Decrement row selection."""
+        current = self.selected_row.get()
+        
+        if current > 1:
+            self.selected_row.set(current - 1)
+            self.update_timeseries_plots()
             self.canvas.draw()
 
 
