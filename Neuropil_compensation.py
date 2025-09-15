@@ -45,6 +45,9 @@ class NeuropilCompensationTool:
         self.local_norm_enabled = tk.BooleanVar(value=False)
         self.capping_percentage = tk.DoubleVar(value=5.0)
         
+        # Median Normalization parameters
+        self.median_norm_enabled = tk.BooleanVar(value=False)
+        
         # Deconvolution parameters and results
         self.sampling_rate = 2.6  # Hz (jRGECO1a)
         self.jrgeco1a_tau_decay = 1.35  # seconds
@@ -55,6 +58,7 @@ class NeuropilCompensationTool:
         self.Fcomp_slider_spikes = None
         self.Fcomp_cc_spikes = None
         self.Fcomp_local_norm_spikes = None
+        self.Fcomp_median_norm_spikes = None
         self.deconvolution_completed = False
         
         self.setup_gui()
@@ -174,6 +178,15 @@ class NeuropilCompensationTool:
         )
         self.capping_spinbox.pack(side=tk.LEFT)
         
+        # Median Normalization toggle
+        self.median_norm_toggle = ttk.Checkbutton(
+            row_frame,
+            text="Median Normalization",
+            variable=self.median_norm_enabled,
+            command=self.on_toggle_change
+        )
+        self.median_norm_toggle.pack(side=tk.LEFT, padx=(20, 0))
+        
         # Progress bar for deconvolution (separate frame)
         self.progress_frame = ttk.Frame(self.root, padding="10")
         self.progress_frame.pack(fill=tk.X)
@@ -264,6 +277,7 @@ class NeuropilCompensationTool:
             self.selected_row.set(1)
             self.cc_compensation_enabled.set(False)
             self.local_norm_enabled.set(False)
+            self.median_norm_enabled.set(False)
             self.on_toggle_change()  # Update UI state
             
             # Reset deconvolution results
@@ -271,6 +285,7 @@ class NeuropilCompensationTool:
             self.Fcomp_slider_spikes = None
             self.Fcomp_cc_spikes = None
             self.Fcomp_local_norm_spikes = None
+            self.Fcomp_median_norm_spikes = None
             self.deconvolution_completed = False
             self.clear_spike_displays()
             
@@ -438,6 +453,74 @@ class NeuropilCompensationTool:
         
         return Fcomp
     
+    def calculate_median_normalization(self):
+        """Calculate Median Normalization: F/median(F) divided by Fneu/median(Fneu), clamped and re-normalized for each row."""
+        if self.F is None or self.Fneu is None:
+            return None
+        
+        Fcomp = np.zeros_like(self.F, dtype=np.float64)
+        
+        # Process each row independently
+        for row_idx in range(self.F.shape[0]):
+            f_row = self.F[row_idx, :].copy().astype(np.float64)
+            fneu_row = self.Fneu[row_idx, :].copy().astype(np.float64)
+            
+            # Step 1: Normalize F and Fneu by their respective medians
+            # Handle NaN values when calculating median
+            f_valid_mask = ~np.isnan(f_row)
+            fneu_valid_mask = ~np.isnan(fneu_row)
+            
+            if np.sum(f_valid_mask) == 0 or np.sum(fneu_valid_mask) == 0:
+                # If all values are NaN, keep the row as NaN
+                Fcomp[row_idx, :] = np.nan
+                continue
+            
+            f_median = np.nanmedian(f_row)
+            fneu_median = np.nanmedian(fneu_row)
+            
+            # Avoid division by zero
+            if f_median == 0 or fneu_median == 0:
+                Fcomp[row_idx, :] = np.nan
+                continue
+            
+            f_norm = f_row / f_median
+            fneu_norm = fneu_row / fneu_median
+            
+            # Step 2: Divide normalized F by normalized Fneu (element-wise)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                divided_row = f_norm / fneu_norm
+            
+            # Step 3: Clamp values below 0.95 to 0.95
+            clamped_row = np.where(divided_row < 0.95, 0.95, divided_row)
+            # Preserve NaN values
+            clamped_row = np.where(np.isnan(divided_row), np.nan, clamped_row)
+            
+            # Step 4: Normalize each row to [0,1] range
+            valid_mask = ~np.isnan(clamped_row)
+            
+            if np.sum(valid_mask) > 0:
+                valid_values = clamped_row[valid_mask]
+                
+                if len(valid_values) > 1:
+                    row_min = np.min(valid_values)
+                    row_max = np.max(valid_values)
+                    
+                    if row_max > row_min:
+                        # Normalize valid values to [0,1]
+                        normalized_valid = (valid_values - row_min) / (row_max - row_min)
+                        clamped_row[valid_mask] = normalized_valid
+                    else:
+                        # If all valid values are the same, set them to 0
+                        clamped_row[valid_mask] = 0.0
+                else:
+                    # Single valid value, set to 0
+                    clamped_row[valid_mask] = 0.0
+            
+            # Store the processed row
+            Fcomp[row_idx, :] = clamped_row
+        
+        return Fcomp
+    
     def update_displays(self):
         """Update all subplot displays."""
         if self.F is None or self.Fneu is None:
@@ -464,6 +547,9 @@ class NeuropilCompensationTool:
         elif self.local_norm_enabled.get():
             Fcomp_normalized = self.calculate_local_normalization()
             title = "Fcomp (Local Normalized)"
+        elif self.median_norm_enabled.get():
+            Fcomp_normalized = self.calculate_median_normalization()
+            title = "Fcomp (Median Normalized)"
         else:
             Fcomp_normalized = self.calculate_compensation(self.compensation_factor.get())
             title = "Fcomp (normalized)"
@@ -499,35 +585,59 @@ class NeuropilCompensationTool:
             self.canvas.draw()
     
     def on_toggle_change(self):
-        """Handle compensation toggle changes with mutual exclusivity."""
+        """Handle compensation toggle changes with 3-way mutual exclusivity."""
         cc_enabled = self.cc_compensation_enabled.get()
         local_norm_enabled = self.local_norm_enabled.get()
+        median_norm_enabled = self.median_norm_enabled.get()
         
-        # Implement mutual exclusivity
-        if cc_enabled and local_norm_enabled:
-            # If both are enabled, disable the one that wasn't just clicked
-            # We can determine this by checking which one changed
-            self.local_norm_enabled.set(False)
-            local_norm_enabled = False
+        # Implement 3-way mutual exclusivity
+        enabled_count = sum([cc_enabled, local_norm_enabled, median_norm_enabled])
+        if enabled_count > 1:
+            # More than one is enabled, disable the others
+            # Keep only the most recently clicked one
+            if median_norm_enabled:
+                self.cc_compensation_enabled.set(False)
+                self.local_norm_enabled.set(False)
+                cc_enabled = False
+                local_norm_enabled = False
+            elif cc_enabled:
+                self.local_norm_enabled.set(False)
+                self.median_norm_enabled.set(False)
+                local_norm_enabled = False
+                median_norm_enabled = False
+            elif local_norm_enabled:
+                self.cc_compensation_enabled.set(False)
+                self.median_norm_enabled.set(False)
+                cc_enabled = False
+                median_norm_enabled = False
         
         # Enable/disable controls based on active compensation method
-        if cc_enabled or local_norm_enabled:
+        any_special_enabled = cc_enabled or local_norm_enabled or median_norm_enabled
+        
+        if any_special_enabled:
             self.slider.config(state='disabled')
             self.factor_label.config(foreground='gray')
         else:
             self.slider.config(state='normal')
             self.factor_label.config(foreground='black')
         
-        # Enable/disable toggles based on state
+        # Enable/disable toggles and controls based on state
         if cc_enabled:
             self.local_norm_toggle.config(state='disabled')
+            self.median_norm_toggle.config(state='disabled')
             self.capping_spinbox.config(state='disabled')
         elif local_norm_enabled:
             self.cc_toggle.config(state='disabled')
+            self.median_norm_toggle.config(state='disabled')
             self.capping_spinbox.config(state='normal')
+        elif median_norm_enabled:
+            self.cc_toggle.config(state='disabled')
+            self.local_norm_toggle.config(state='disabled')
+            self.capping_spinbox.config(state='disabled')
         else:
             self.cc_toggle.config(state='normal')
             self.local_norm_toggle.config(state='normal')
+            self.median_norm_toggle.config(state='normal')
             self.capping_spinbox.config(state='normal')
         
         # Update all displays with new compensation method
@@ -581,6 +691,8 @@ class NeuropilCompensationTool:
             Fcomp_normalized = self.calculate_cc_compensation()
         elif self.local_norm_enabled.get():
             Fcomp_normalized = self.calculate_local_normalization()
+        elif self.median_norm_enabled.get():
+            Fcomp_normalized = self.calculate_median_normalization()
         else:
             factor = self.compensation_factor.get()
             Fcomp = self.F - factor * self.Fneu
@@ -695,6 +807,8 @@ class NeuropilCompensationTool:
             Fcomp_normalized = self.calculate_cc_compensation()
         elif self.local_norm_enabled.get():
             Fcomp_normalized = self.calculate_local_normalization()
+        elif self.median_norm_enabled.get():
+            Fcomp_normalized = self.calculate_median_normalization()
         else:
             factor = self.compensation_factor.get()
             Fcomp = self.F - factor * self.Fneu
@@ -924,6 +1038,14 @@ class NeuropilCompensationTool:
             self.Fcomp_local_norm_spikes = Fcomp_local_norm_spikes
             all_failed_traces.extend([(trace, "Fcomp_LocalNorm") for trace in Fcomp_local_norm_failed])
             
+            # 5. Deconvolve Fcomp (Median Normalization)
+            self.progress_var.set("Calculating Fcomp (Median Norm)...")
+            self.root.update()
+            Fcomp_median_norm = self.calculate_median_normalization_raw()  # Get raw Median Norm matrix
+            Fcomp_median_norm_spikes, Fcomp_median_norm_failed = self.deconvolve_matrix(Fcomp_median_norm, "Fcomp (Median Norm)")
+            self.Fcomp_median_norm_spikes = Fcomp_median_norm_spikes
+            all_failed_traces.extend([(trace, "Fcomp_MedianNorm") for trace in Fcomp_median_norm_failed])
+            
             # Update displays
             self.progress_var.set("Updating displays...")
             self.root.update()
@@ -935,7 +1057,7 @@ class NeuropilCompensationTool:
             # Show completion message
             total_traces = self.F.shape[0]
             total_failed = len(all_failed_traces)
-            success_rate = ((total_traces * 4 - total_failed) / (total_traces * 4)) * 100
+            success_rate = ((total_traces * 5 - total_failed) / (total_traces * 5)) * 100
             
             completion_msg = f"Deconvolution completed!\\nSuccess rate: {success_rate:.1f}%"
             if total_failed > 0:
@@ -1063,10 +1185,96 @@ class NeuropilCompensationTool:
         
         return Fcomp
     
+    def calculate_median_normalization_raw(self):
+        """Calculate raw Median Normalization matrix (not normalized) for deconvolution."""
+        if self.F is None or self.Fneu is None:
+            return None
+        
+        Fcomp = np.zeros_like(self.F, dtype=np.float64)
+        
+        # Process each row independently
+        for row_idx in range(self.F.shape[0]):
+            f_row = self.F[row_idx, :].copy().astype(np.float64)
+            fneu_row = self.Fneu[row_idx, :].copy().astype(np.float64)
+            
+            # Step 1: Normalize F and Fneu by their respective medians
+            # Handle NaN values when calculating median
+            f_valid_mask = ~np.isnan(f_row)
+            fneu_valid_mask = ~np.isnan(fneu_row)
+            
+            if np.sum(f_valid_mask) == 0 or np.sum(fneu_valid_mask) == 0:
+                # If all values are NaN, keep the row as NaN
+                Fcomp[row_idx, :] = np.nan
+                continue
+            
+            f_median = np.nanmedian(f_row)
+            fneu_median = np.nanmedian(fneu_row)
+            
+            # Avoid division by zero
+            if f_median == 0 or fneu_median == 0:
+                Fcomp[row_idx, :] = np.nan
+                continue
+            
+            f_norm = f_row / f_median
+            fneu_norm = fneu_row / fneu_median
+            
+            # Step 2: Divide normalized F by normalized Fneu (element-wise)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                divided_row = f_norm / fneu_norm
+            
+            # Step 3: Clamp values below 0.95 to 0.95
+            clamped_row = np.where(divided_row < 0.95, 0.95, divided_row)
+            # Preserve NaN values
+            clamped_row = np.where(np.isnan(divided_row), np.nan, clamped_row)
+            
+            # Step 4: Normalize each row to [0,1] range, then scale to original F range
+            valid_mask = ~np.isnan(clamped_row)
+            
+            if np.sum(valid_mask) > 0:
+                valid_values = clamped_row[valid_mask]
+                
+                if len(valid_values) > 1:
+                    row_min = np.min(valid_values)
+                    row_max = np.max(valid_values)
+                    
+                    if row_max > row_min:
+                        # Normalize to [0,1] then scale to original F range
+                        normalized_valid = (valid_values - row_min) / (row_max - row_min)
+                        
+                        # Scale to original F row range for deconvolution
+                        f_valid_mask_orig = ~np.isnan(f_row)
+                        
+                        if np.sum(f_valid_mask_orig) > 0:
+                            f_min = np.nanmin(f_row)
+                            f_max = np.nanmax(f_row)
+                            scaled_valid = normalized_valid * (f_max - f_min) + f_min
+                            clamped_row[valid_mask] = scaled_valid
+                        else:
+                            clamped_row[valid_mask] = normalized_valid
+                    else:
+                        # Use original F values if no variation
+                        f_raw_values = f_row[valid_mask]
+                        clamped_row[valid_mask] = f_raw_values
+                else:
+                    # Single valid value, use original F value
+                    f_raw_values = f_row[valid_mask]
+                    clamped_row[valid_mask] = f_raw_values
+            
+            # Store the processed row
+            Fcomp[row_idx, :] = clamped_row
+        
+        return Fcomp
+    
     def update_spike_displays(self):
         """Update the right column spike matrix displays."""
         # Determine which spike matrices to show based on active compensation method
-        if self.local_norm_enabled.get():
+        if self.median_norm_enabled.get():
+            spike_matrices = [
+                (self.F_spikes, "F Spikes"),
+                (self.Fcomp_median_norm_spikes, "Fcomp Spikes (Median Norm)"),
+                (self.Fcomp_cc_spikes, "Fcomp Spikes (CC)")
+            ]
+        elif self.local_norm_enabled.get():
             spike_matrices = [
                 (self.F_spikes, "F Spikes"),
                 (self.Fcomp_local_norm_spikes, "Fcomp Spikes (Local Norm)"),
@@ -1127,6 +1335,7 @@ class NeuropilCompensationTool:
         slider_failed = [trace for trace, matrix in failed_traces if matrix == "Fcomp_slider"]
         cc_failed = [trace for trace, matrix in failed_traces if matrix == "Fcomp_CC"]
         local_norm_failed = [trace for trace, matrix in failed_traces if matrix == "Fcomp_LocalNorm"]
+        median_norm_failed = [trace for trace, matrix in failed_traces if matrix == "Fcomp_MedianNorm"]
         
         log_content = f"Deconvolution Failed Traces Log\\n"
         log_content += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n"
@@ -1143,6 +1352,9 @@ class NeuropilCompensationTool:
         
         if local_norm_failed:
             log_content += f"Fcomp (Local Norm) failed traces ({len(local_norm_failed)}): {', '.join(map(str, local_norm_failed))}\\n\\n"
+        
+        if median_norm_failed:
+            log_content += f"Fcomp (Median Norm) failed traces ({len(median_norm_failed)}): {', '.join(map(str, median_norm_failed))}\\n\\n"
         
         log_content += "These traces are displayed as white (NaN) in the spike matrices."
         
@@ -1164,7 +1376,8 @@ class NeuropilCompensationTool:
         
         # Check if all spike matrices are available
         if (self.F_spikes is None or self.Fcomp_slider_spikes is None or 
-            self.Fcomp_cc_spikes is None or self.Fcomp_local_norm_spikes is None):
+            self.Fcomp_cc_spikes is None or self.Fcomp_local_norm_spikes is None or
+            self.Fcomp_median_norm_spikes is None):
             messagebox.showwarning("Warning", "Spike matrices are not available. Please run deconvolution first!")
             return
         
@@ -1177,19 +1390,22 @@ class NeuropilCompensationTool:
             fcomp_slider_filename = os.path.join(self.current_folder, f"Fcomp_{slider_value:.3f}.npy")
             fcomp_cc_filename = os.path.join(self.current_folder, "Fcomp_CC.npy")
             fcomp_local_norm_filename = os.path.join(self.current_folder, "Fcomp_FneuNorm_Spks.npy")
+            fcomp_median_norm_filename = os.path.join(self.current_folder, "Fcomp_spks_MedNorm.npy")
             
             # Save the matrices
             np.save(f_filename, self.F_spikes)
             np.save(fcomp_slider_filename, self.Fcomp_slider_spikes)
             np.save(fcomp_cc_filename, self.Fcomp_cc_spikes)
             np.save(fcomp_local_norm_filename, self.Fcomp_local_norm_spikes)
+            np.save(fcomp_median_norm_filename, self.Fcomp_median_norm_spikes)
             
             # Show success message with file locations
             success_msg = f"Successfully saved spike matrices:\\n\\n"
             success_msg += f"• F_deconv.npy\\n"
             success_msg += f"• Fcomp_{slider_value:.3f}.npy\\n"
             success_msg += f"• Fcomp_CC.npy\\n"
-            success_msg += f"• Fcomp_FneuNorm_Spks.npy\\n\\n"
+            success_msg += f"• Fcomp_FneuNorm_Spks.npy\\n"
+            success_msg += f"• Fcomp_spks_MedNorm.npy\\n\\n"
             success_msg += f"Location: {self.current_folder}"
             
             messagebox.showinfo("Save Complete", success_msg)
