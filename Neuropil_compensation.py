@@ -32,6 +32,9 @@ class NeuropilCompensationTool:
         self.Fneu_normalized = None  # Cached normalized Fneu
         self.current_folder = None
         
+        # ROI size information
+        self.roi_sizes = None  # Array of ROI sizes in pixels
+        
         # Compensation parameters
         self.compensation_factor = tk.DoubleVar(value=0.0)
         
@@ -47,6 +50,7 @@ class NeuropilCompensationTool:
         
         # Median Normalization parameters
         self.median_norm_enabled = tk.BooleanVar(value=False)
+        self.median_norm_fneu_weight = tk.DoubleVar(value=100.0)  # Fneu weight percentage (0-100%)
         
         # Deconvolution parameters and results
         self.sampling_rate = 2.6  # Hz (jRGECO1a)
@@ -187,6 +191,22 @@ class NeuropilCompensationTool:
         )
         self.median_norm_toggle.pack(side=tk.LEFT, padx=(20, 0))
         
+        # Fneu weight slider for Median Normalization
+        ttk.Label(row_frame, text="Fneu weight:").pack(side=tk.LEFT, padx=(10, 5))
+        self.median_norm_fneu_weight_slider = ttk.Scale(
+            row_frame,
+            from_=0,
+            to=100,
+            variable=self.median_norm_fneu_weight,
+            orient=tk.HORIZONTAL,
+            length=100,
+            command=self.on_fneu_weight_change
+        )
+        self.median_norm_fneu_weight_slider.pack(side=tk.LEFT)
+        
+        self.fneu_weight_label = ttk.Label(row_frame, text="100%")
+        self.fneu_weight_label.pack(side=tk.LEFT, padx=(5, 0))
+        
         # Progress bar for deconvolution (separate frame)
         self.progress_frame = ttk.Frame(self.root, padding="10")
         self.progress_frame.pack(fill=tk.X)
@@ -273,11 +293,20 @@ class NeuropilCompensationTool:
             self.F_normalized = self.normalize_matrix(self.F)
             self.Fneu_normalized = self.normalize_matrix(self.Fneu)
             
+            # Load ROI sizes from stat.npy
+            roi_loaded = self.load_roi_sizes()
+            if not roi_loaded:
+                messagebox.showwarning("ROI Size Warning", 
+                    "Could not load ROI size information from stat.npy.\n"
+                    "Time series plots will not show ROI sizes.")
+            
             # Reset row selector to valid range and compensation states
             self.selected_row.set(1)
             self.cc_compensation_enabled.set(False)
             self.local_norm_enabled.set(False)
             self.median_norm_enabled.set(False)
+            self.median_norm_fneu_weight.set(100.0)  # Reset Fneu weight to default
+            self.fneu_weight_label.config(text="100%")  # Update label
             self.on_toggle_change()  # Update UI state
             
             # Reset deconvolution results
@@ -302,6 +331,7 @@ class NeuropilCompensationTool:
             self.Fneu = None
             self.F_normalized = None
             self.Fneu_normalized = None
+            self.roi_sizes = None
     
     def remove_artifacts(self):
         """Remove artifacts by replacing specific columns with NaN values."""
@@ -486,9 +516,16 @@ class NeuropilCompensationTool:
             f_norm = f_row / f_median
             fneu_norm = fneu_row / fneu_median
             
-            # Step 2: Divide normalized F by normalized Fneu (element-wise)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                divided_row = f_norm / fneu_norm
+            # Step 2: Apply Fneu weight factor and divide
+            fneu_weight = self.median_norm_fneu_weight.get() / 100.0  # Convert to 0.0-1.0
+            
+            if fneu_weight == 0:
+                # No compensation - just use normalized F
+                divided_row = f_norm
+            else:
+                # Apply weighted compensation
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    divided_row = f_norm / (fneu_weight * fneu_norm)
             
             # Step 3: Clamp values below 0.95 to 0.95
             clamped_row = np.where(divided_row < 0.95, 0.95, divided_row)
@@ -634,11 +671,13 @@ class NeuropilCompensationTool:
             self.cc_toggle.config(state='disabled')
             self.local_norm_toggle.config(state='disabled')
             self.capping_spinbox.config(state='disabled')
+            self.median_norm_fneu_weight_slider.config(state='normal')
         else:
             self.cc_toggle.config(state='normal')
             self.local_norm_toggle.config(state='normal')
             self.median_norm_toggle.config(state='normal')
             self.capping_spinbox.config(state='normal')
+            self.median_norm_fneu_weight_slider.config(state='disabled')
         
         # Update all displays with new compensation method
         if self.F is not None and self.Fneu is not None:
@@ -649,6 +688,17 @@ class NeuropilCompensationTool:
     def on_capping_change(self):
         """Handle capping percentage changes."""
         if self.local_norm_enabled.get() and self.F is not None and self.Fneu is not None:
+            self.update_displays()
+            self.update_timeseries_plots()
+            self.canvas.draw()
+    
+    def on_fneu_weight_change(self, value):
+        """Handle Fneu weight slider changes."""
+        weight = float(value)
+        self.fneu_weight_label.config(text=f"{weight:.0f}%")
+        
+        # Only update if Median Normalization is enabled and data is loaded
+        if self.median_norm_enabled.get() and self.F is not None and self.Fneu is not None:
             self.update_displays()
             self.update_timeseries_plots()
             self.canvas.draw()
@@ -712,6 +762,9 @@ class NeuropilCompensationTool:
             # Calculate correlation between F and Fneu (independent of compensation)
             correlation = self.calculate_correlation(f_row, fneu_row)
             
+            # Get ROI size for this trace
+            roi_size = self.get_roi_size_for_trace(current_row)
+            
             # Create time axis
             time_points = np.arange(len(f_row))
             
@@ -720,12 +773,21 @@ class NeuropilCompensationTool:
             ax.plot(time_points, fneu_row, 'r-', label='Fneu', linewidth=1.5)
             ax.plot(time_points, fcomp_row, 'k-', label='Fcomp', linewidth=1.5)
             
-            # Configure plot with correlation in title
+            # Configure plot with correlation and ROI size in title
             ax.set_ylim(0, 1)
+            title_parts = [f"Row {current_row + 1} Time Series"]
+            
+            # Add correlation info
             if np.isnan(correlation):
-                ax.set_title(f"Row {current_row + 1} Time Series (corr=NaN)")
+                title_parts.append("corr=NaN")
             else:
-                ax.set_title(f"Row {current_row + 1} Time Series (corr={correlation:.2f})")
+                title_parts.append(f"corr={correlation:.2f}")
+            
+            # Add ROI size info if available
+            if roi_size is not None:
+                title_parts.append(f"ROI={roi_size}px")
+            
+            ax.set_title(f"{title_parts[0]} ({', '.join(title_parts[1:])})")
             ax.grid(True, alpha=0.3)
             ax.legend(loc='upper right', fontsize=8)
             
@@ -1218,9 +1280,16 @@ class NeuropilCompensationTool:
             f_norm = f_row / f_median
             fneu_norm = fneu_row / fneu_median
             
-            # Step 2: Divide normalized F by normalized Fneu (element-wise)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                divided_row = f_norm / fneu_norm
+            # Step 2: Apply Fneu weight factor and divide
+            fneu_weight = self.median_norm_fneu_weight.get() / 100.0  # Convert to 0.0-1.0
+            
+            if fneu_weight == 0:
+                # No compensation - just use normalized F
+                divided_row = f_norm
+            else:
+                # Apply weighted compensation
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    divided_row = f_norm / (fneu_weight * fneu_norm)
             
             # Step 3: Clamp values below 0.95 to 0.95
             clamped_row = np.where(divided_row < 0.95, 0.95, divided_row)
@@ -1264,6 +1333,54 @@ class NeuropilCompensationTool:
             Fcomp[row_idx, :] = clamped_row
         
         return Fcomp
+    
+    def load_roi_sizes(self):
+        """Load ROI sizes from stat.npy file in the suite2p folder."""
+        if self.current_folder is None:
+            return False
+        
+        # Look for stat.npy in the current folder (should be suite2p/plane0)
+        stat_path = os.path.join(self.current_folder, "stat.npy")
+        
+        if not os.path.exists(stat_path):
+            print(f"Warning: stat.npy not found at {stat_path}")
+            self.roi_sizes = None
+            return False
+        
+        try:
+            # Load stat.npy file
+            stat_data = np.load(stat_path, allow_pickle=True)
+            
+            # Validate dimensions match F/Fneu matrices
+            if self.F is not None and len(stat_data) != self.F.shape[0]:
+                print(f"Warning: stat.npy has {len(stat_data)} entries but F.npy has {self.F.shape[0]} rows")
+                self.roi_sizes = None
+                return False
+            
+            # Extract ROI sizes
+            roi_sizes = []
+            for i, roi_stat in enumerate(stat_data):
+                if isinstance(roi_stat, dict) and 'ypix' in roi_stat:
+                    roi_size = len(roi_stat['ypix'])
+                    roi_sizes.append(roi_size)
+                else:
+                    print(f"Warning: ROI {i} missing 'ypix' data")
+                    roi_sizes.append(0)  # Default to 0 if data is missing
+            
+            self.roi_sizes = roi_sizes
+            print(f"Successfully loaded ROI sizes: {len(roi_sizes)} ROIs, sizes range {min(roi_sizes)}-{max(roi_sizes)} pixels")
+            return True
+            
+        except Exception as e:
+            print(f"Error loading stat.npy: {str(e)}")
+            self.roi_sizes = None
+            return False
+    
+    def get_roi_size_for_trace(self, trace_index):
+        """Get ROI size for a specific trace index (0-based)."""
+        if self.roi_sizes is None or trace_index >= len(self.roi_sizes):
+            return None
+        return self.roi_sizes[trace_index]
     
     def update_spike_displays(self):
         """Update the right column spike matrix displays."""
